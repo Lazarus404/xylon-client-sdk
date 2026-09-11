@@ -1,0 +1,59 @@
+{
+  "name": "xylon-client-sdk",
+  "version": "0.1.0",
+  "description": "Browser client SDK for Xylon Control WebSocket JSEP (host-minted tokens)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --clean",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm test && npm run build"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lazarus404/xylon-client-sdk.git"
+  },
+  "homepage": "https://github.com/Lazarus404/xylon-client-sdk",
+  "bugs": {
+    "url": "https://github.com/Lazarus404/xylon-client-sdk/issues"
+  },
+  "keywords": [
+    "xylon",
+    "webrtc",
+    "websocket",
+    "sfu",
+    "jsep"
+  ],
+  "license": "UNLICENSED",
+  "peerDependencies": {
+    "@msgpack/msgpack": "^3.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@msgpack/msgpack": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@msgpack/msgpack": "^3.1.1",
+    "tsup": "^8.4.0",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.8"
+  }
+}
