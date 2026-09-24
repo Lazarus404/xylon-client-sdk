@@ -30,11 +30,19 @@ export type ConnectOptions = {
   dataChannelLabels?: string[];
   /** Max wait for each `dataChannelLabels` channel to open (default 15000). */
   dataChannelTimeoutMs?: number;
+  /** Max wait for ICE gathering before posting offer (default 5000). */
+  iceGatherTimeoutMs?: number;
   /**
    * Local A/V tracks added before `createOffer` (conference / echo).
    * Required for outbound media; omit for datachannel-only rooms.
    */
   mediaStream?: MediaStream;
+  /**
+   * Optional video publish knobs (simulcast / SVC). When set with a video
+   * track in `mediaStream`, connect uses `addTransceiver` instead of
+   * `addTrack` so Chrome can emit SIM encodings or `scalabilityMode`.
+   */
+  videoPublish?: VideoPublishOptions;
   iceServers?: RTCIceServer[];
   /** Injected WebSocket constructor (tests). Defaults to global `WebSocket`. */
   WebSocketImpl?: typeof WebSocket;
@@ -63,6 +71,23 @@ export type WsLike = {
 
 export type MediaKind = "audio" | "video";
 
+/**
+ * Publish-side video options for Chrome SIM / SVC labs.
+ *
+ * ## Fields
+ *
+ * - `codec` -- prefer this video mime (e.g. `video/VP8`, `video/VP9`, `video/AV1`)
+ * - `simulcast` -- when true, three RID encodings (q/h/f) for VP8 SIM
+ * - `scalabilityMode` -- Chrome SVC mode (e.g. `L3T3_KEY`) on a single encoding
+ * - `encodings` -- explicit `RTCRtpEncodingParameters` (wins over simulcast defaults)
+ */
+export type VideoPublishOptions = {
+  codec?: string;
+  simulcast?: boolean;
+  scalabilityMode?: string;
+  encodings?: RTCRtpEncodingParameters[];
+};
+
 /** Params for Control WS subscribe / unsubscribe / switch. */
 export type SubscribeParams = {
   publisherId: string;
@@ -77,6 +102,12 @@ export type SubscribeParams = {
   substream?: number;
   /** Simulcast RID when layers carry `rid` from SDP. */
   rid?: string;
+  /** Max VP8 temporal layer (TID) to forward; omit for no filter. */
+  temporal?: number;
+  /** Max VP9 / AV1 SVC spatial layer (Janus `spatial_layer`). */
+  spatialLayer?: number;
+  /** Max VP9 / AV1 SVC temporal layer (Janus `temporal_layer`). */
+  temporalLayer?: number;
 };
 
 export type PresenceParticipant = {
@@ -131,10 +162,29 @@ export type FeedsDiffFrame = {
   video_codec?: string;
 };
 
+export type GroupsSnapshotFrame = {
+  type: "groups.snapshot";
+  groups: Record<string, string[]>;
+};
+
+export type GroupsDiffFrame = {
+  type: "groups.diff";
+  action: "create" | "delete" | "add_member" | "remove_member";
+  group_id: string;
+  participant_id?: string;
+};
+
 export type TalkingFrame = {
   type: "talking" | "stopped-talking";
   participant_id: string;
   audio_level_dbov_avg?: number;
+};
+
+/** Uplink Dynacast: which SIM RIDs the publisher should keep active. */
+export type PublishLayersFrame = {
+  type: "publish_layers";
+  mid: string;
+  layers: Array<{ rid: string; active: boolean }>;
 };
 
 export type ServerFrame =
@@ -148,13 +198,17 @@ export type ServerFrame =
       sdpMLineIndex?: number;
     }
   | { type: "ice_complete" }
+  | PublishLayersFrame
   | { type: "subscribed" }
   | { type: "unsubscribed" }
   | { type: "switched" }
+  | { type: "substream_set" }
   | PresenceSnapshotFrame
   | PresenceDiffFrame
   | FeedsSnapshotFrame
   | FeedsDiffFrame
+  | GroupsSnapshotFrame
+  | GroupsDiffFrame
   | TalkingFrame
   | {
       type: "migrate.required";

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { RpcClient, RpcError, createRpcClient } from "../src/rpc.js";
-import { CHAT_LABEL, GAME_DATA_CHANNEL_LABELS, RPC_LABEL } from "../src/labels.js";
+import { CHAT_LABEL, GAME_DATA_CHANNEL_LABELS, INPUT_LABEL, RPC_LABEL } from "../src/labels.js";
+import { defaultDataChannelInit } from "../src/labels.js";
 
 class FakeDc {
   label: string;
@@ -37,6 +38,12 @@ describe("labels", () => {
     expect(CHAT_LABEL).toBe("chat");
     expect(RPC_LABEL).toBe("rpc");
     expect(GAME_DATA_CHANNEL_LABELS).toContain("state");
+    expect(GAME_DATA_CHANNEL_LABELS).not.toContain("input");
+    expect(INPUT_LABEL).toBe("input");
+    expect(defaultDataChannelInit("input")).toEqual({
+      ordered: false,
+      maxRetransmits: 0
+    });
   });
 });
 
@@ -109,6 +116,38 @@ describe("RpcClient", () => {
     expect(res.type).toBe("rpc.res");
     expect(res.payload).toEqual({ echo: { x: 1 } });
     client.close();
+  });
+
+  it("performRpc accepts star and id list; handles star inbound", async () => {
+    const dc = new FakeDc();
+    const client = new RpcClient({ localParticipantId: "a", channel: dc });
+    const p = client.performRpc("*", "ping", null, { timeoutMs: 1000 });
+    expect(JSON.parse(dc.sent[0]!).to).toBe("*");
+    dc.deliver(JSON.stringify({ type: "rpc.res", id: JSON.parse(dc.sent[0]!).id, payload: 1 }));
+    await expect(p).resolves.toBe(1);
+
+    const p2 = client.performRpc(["b", "c"], "ping", null, { timeoutMs: 1000 });
+    expect(JSON.parse(dc.sent[1]!).to).toEqual(["b", "c"]);
+    dc.deliver(JSON.stringify({ type: "rpc.res", id: JSON.parse(dc.sent[1]!).id, payload: 2 }));
+    await expect(p2).resolves.toBe(2);
+    client.close();
+
+    const calleeDc = new FakeDc();
+    const callee = new RpcClient({ localParticipantId: "b", channel: calleeDc });
+    callee.registerRpcMethod("ping", () => "ok");
+    calleeDc.deliver(
+      JSON.stringify({
+        type: "rpc.req",
+        id: "3",
+        method: "ping",
+        to: "*",
+        from: "a",
+        payload: null
+      })
+    );
+    await vi.waitFor(() => expect(calleeDc.sent.length).toBe(1));
+    expect(JSON.parse(calleeDc.sent[0]!).type).toBe("rpc.res");
+    callee.close();
   });
 
   it("createRpcClient uses getChannel", () => {

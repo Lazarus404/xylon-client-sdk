@@ -1,14 +1,19 @@
 import { ControlSignaling, SignalingError } from "./signaling.js";
 import { defaultDataChannelInit } from "./labels.js";
+import { sendJson } from "./send.js";
 import type {
   ConnectOptions,
   FeedsDiffFrame,
   FeedsSnapshotFrame,
+  GroupsDiffFrame,
+  GroupsSnapshotFrame,
   IceCandidateParams,
   PresenceDiffFrame,
   PresenceSnapshotFrame,
+  PublishLayersFrame,
   SubscribeParams,
-  TalkingFrame
+  TalkingFrame,
+  VideoPublishOptions
 } from "./types.js";
 
 type ConnectionStateHandler = (state: string) => void;
@@ -34,8 +39,14 @@ export class XylonRoom {
   onFeedsSnapshot: ((frame: FeedsSnapshotFrame) => void) | null = null;
   /** Publisher published / unpublished. */
   onFeedsDiff: ((frame: FeedsDiffFrame) => void) | null = null;
+  /** Named groups snapshot after Control WS join. */
+  onGroupsSnapshot: ((frame: GroupsSnapshotFrame) => void) | null = null;
+  /** Group create/delete/member change. */
+  onGroupsDiff: ((frame: GroupsDiffFrame) => void) | null = null;
   /** Talking / stopped-talking (layout only; never auto-subscribe). */
   onTalking: ((frame: TalkingFrame) => void) | null = null;
+  /** Dynacast publish_layers (optional; room applies setParameters by default). */
+  onPublishLayers: ((frame: PublishLayersFrame) => void) | null = null;
 
   private signaling: ControlSignaling | null = null;
   private pc: RTCPeerConnection | null = null;
@@ -111,13 +122,12 @@ export class XylonRoom {
     }
 
     if (opts.mediaStream) {
-      for (const track of opts.mediaStream.getTracks()) {
-        this.pc.addTrack(track, opts.mediaStream);
-      }
+      addLocalMedia(this.pc, opts.mediaStream, opts.videoPublish);
     }
 
     const offer = await this.pc.createOffer();
     await this.pc.setLocalDescription(offer);
+    await waitIceGatheringComplete(this.pc, opts.iceGatherTimeoutMs ?? 5_000);
 
     const localSdp = this.pc.localDescription?.sdp;
     if (!localSdp) throw new SignalingError("missing_local_sdp");
@@ -153,6 +163,11 @@ export class XylonRoom {
     return this.requireSignaling().switch(params);
   }
 
+  /** Changes simulcast / SVC layer opts on an existing route. */
+  setSubstream(params: SubscribeParams): Promise<void> {
+    return this.requireSignaling().setSubstream(params);
+  }
+
   createDataChannel(label: string, init?: RTCDataChannelInit): RTCDataChannel {
     if (!this.pc) throw new SignalingError("not_connected");
     const existing = this.localChannels.get(label);
@@ -169,6 +184,20 @@ export class XylonRoom {
   /** Local channel opened at connect via `dataChannelLabels`, if any. */
   dataChannel(label: string): RTCDataChannel | null {
     return this.localChannels.get(label) ?? null;
+  }
+
+  /**
+   * Sends a JSON object on a labeled local datachannel.
+   * Optional `dest` sets envelope `"to"` (participant id or id list).
+   */
+  send(
+    label: string,
+    payload: Record<string, unknown> | string,
+    opts?: { dest?: string | string[] }
+  ): void {
+    const dc = this.dataChannel(label);
+    if (!dc) throw new SignalingError("datachannel_missing");
+    sendJson(dc, payload, opts);
   }
 
   close(): void {
@@ -189,6 +218,15 @@ export class XylonRoom {
     }
     this.signaling = null;
     this.emitConnectionState("closed");
+  }
+
+  /**
+   * Explicit reconnect: `close()` then `connect(opts)` with a fresh token via
+   * `getToken` / `token`. Does not auto-retry on ICE failure.
+   */
+  async reconnect(opts: ConnectOptions): Promise<void> {
+    this.close();
+    await this.connect(opts);
   }
 
   private requireSignaling(): ControlSignaling {
@@ -240,10 +278,76 @@ export class XylonRoom {
       this.onFeedsDiff?.(frame);
     };
 
+    sig.onGroupsSnapshot = (frame) => {
+      if (this.closed) return;
+      this.onGroupsSnapshot?.(frame);
+    };
+
+    sig.onGroupsDiff = (frame) => {
+      if (this.closed) return;
+      this.onGroupsDiff?.(frame);
+    };
+
     sig.onTalking = (frame) => {
       if (this.closed) return;
       this.onTalking?.(frame);
     };
+
+    sig.onPublishLayers = (frame) => {
+      if (this.closed) return;
+      this.onPublishLayers?.(frame);
+      void this.applyPublishLayers(frame);
+    };
+  }
+
+  /**
+   * Applies Dynacast `publish_layers` via `RTCRtpSender.setParameters`.
+   * Scopes to the local transceiver whose `mid` matches `frame.mid`, then
+   * toggles encodings by `rid`. Chrome-first; Firefox Soft spot if
+   * `active: false` is ignored (caller may use min-bitrate workaround).
+   */
+  private async applyPublishLayers(frame: PublishLayersFrame): Promise<void> {
+    const pc = this.pc;
+    if (!pc || this.closed) return;
+
+    const byRid = new Map(frame.layers.map((l) => [l.rid, l.active]));
+    if (byRid.size === 0) return;
+
+    const mid = frame.mid;
+    const senders =
+      typeof pc.getTransceivers === "function"
+        ? pc
+            .getTransceivers()
+            .filter((tr) => tr.mid === mid)
+            .map((tr) => tr.sender)
+        : pc.getSenders();
+
+    for (const sender of senders) {
+      if (!sender.track || sender.track.kind !== "video") continue;
+      const params = sender.getParameters();
+      const encodings = params.encodings ?? [];
+      if (encodings.length === 0) continue;
+
+      let changed = false;
+      for (const enc of encodings) {
+        const rid = enc.rid;
+        if (typeof rid !== "string" || !byRid.has(rid)) continue;
+        const active = byRid.get(rid)!;
+        if (enc.active !== active) {
+          enc.active = active;
+          changed = true;
+        }
+      }
+
+      if (!changed) continue;
+
+      try {
+        await sender.setParameters(params);
+      } catch (err) {
+        const e = err instanceof Error ? err : new Error(String(err));
+        this.onerror?.(e);
+      }
+    }
   }
 
   private async flushServerIceBuffer(): Promise<void> {
@@ -297,6 +401,16 @@ export class XylonRoom {
       const mid = ev.candidate.sdpMid;
       if (!mid) {
         this.onerror?.(new SignalingError("missing_mid"));
+        return;
+      }
+
+      // Firefox may signal end-of-candidates with candidate: "" instead of null.
+      if (ev.candidate.candidate === "") {
+        this.handleIce({
+          candidate: null,
+          sdpMid: mid,
+          endOfCandidates: true
+        });
         return;
       }
 
@@ -363,6 +477,105 @@ async function resolveToken(opts: ConnectOptions): Promise<string | undefined> {
     return t;
   }
   return opts.token;
+}
+
+/** Adds local tracks; video may use transceiver + encodings / scalabilityMode. */
+function addLocalMedia(
+  pc: RTCPeerConnection,
+  stream: MediaStream,
+  videoPublish?: VideoPublishOptions
+): void {
+  for (const track of stream.getTracks()) {
+    if (track.kind === "video" && videoPublish) {
+      const encodings = resolveVideoEncodings(videoPublish);
+      const init: RTCRtpTransceiverInit = {
+        direction: "sendrecv",
+        streams: [stream],
+        sendEncodings: encodings
+      };
+      const transceiver = pc.addTransceiver(track, init);
+      maybePreferCodec(transceiver, videoPublish.codec);
+    } else {
+      pc.addTrack(track, stream);
+    }
+  }
+}
+
+function resolveVideoEncodings(
+  opts: VideoPublishOptions
+): RTCRtpEncodingParameters[] {
+  if (opts.encodings && opts.encodings.length > 0) {
+    return opts.encodings;
+  }
+  if (opts.scalabilityMode) {
+    return [{ scalabilityMode: opts.scalabilityMode } as RTCRtpEncodingParameters];
+  }
+  if (opts.simulcast) {
+    return [
+      { rid: "q", scaleResolutionDownBy: 4, maxBitrate: 150_000 },
+      { rid: "h", scaleResolutionDownBy: 2, maxBitrate: 500_000 },
+      { rid: "f", maxBitrate: 1_200_000 }
+    ];
+  }
+  return [{}];
+}
+
+function maybePreferCodec(
+  transceiver: RTCRtpTransceiver,
+  codecMime?: string
+): void {
+  if (!codecMime || typeof transceiver.setCodecPreferences !== "function") {
+    return;
+  }
+  const caps = RTCRtpSender.getCapabilities?.("video");
+  if (!caps?.codecs?.length) return;
+  const want = codecMime.toLowerCase();
+  const preferred = caps.codecs.filter((c) =>
+    (c.mimeType || "").toLowerCase().includes(want.replace(/^video\//, ""))
+  );
+  if (preferred.length === 0) return;
+  const rest = caps.codecs.filter((c) => !preferred.includes(c));
+  try {
+    transceiver.setCodecPreferences([...preferred, ...rest]);
+  } catch {
+    // Soft spot: some browsers reject preferences; leave default order.
+  }
+}
+
+/** Resolves when ICE gathering is complete, or after `timeoutMs` (whichever first). */
+export function waitIceGatheringComplete(
+  pc: RTCPeerConnection,
+  timeoutMs = 5_000
+): Promise<void> {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearInterval(poll);
+      clearTimeout(timer);
+      try {
+        pc.removeEventListener("icegatheringstatechange", onChange);
+      } catch {
+        /* fake PCs may omit EventTarget */
+      }
+      resolve();
+    };
+    const onChange = () => {
+      if (pc.iceGatheringState === "complete") finish();
+    };
+    try {
+      pc.addEventListener("icegatheringstatechange", onChange);
+    } catch {
+      /* ignore */
+    }
+    const poll = setInterval(() => {
+      if (pc.iceGatheringState === "complete") finish();
+    }, 10);
+    const timer = setTimeout(finish, timeoutMs);
+  });
 }
 
 /** Resolves when `dc` is open, or rejects on close/timeout. */

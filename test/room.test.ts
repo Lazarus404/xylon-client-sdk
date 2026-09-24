@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import { XylonRoom } from "../src/room.js";
+import { XylonRoom, waitIceGatheringComplete } from "../src/room.js";
 import { FakeWebSocket } from "./fake_ws.js";
-import { FakeRTCPeerConnection } from "./fake_pc.js";
+import { FakeRTCPeerConnection, FakeRtpSender, FakeRtpTransceiver } from "./fake_pc.js";
 
 function installWs(
   autoReply: (frame: Record<string, unknown>) => Record<string, unknown> | null
@@ -15,6 +15,62 @@ function installWs(
 }
 
 describe("XylonRoom", () => {
+  it("waitIceGatheringComplete resolves when gathering finishes", async () => {
+    const pc = new FakeRTCPeerConnection();
+    pc.iceGatheringState = "gathering";
+    const done = waitIceGatheringComplete(pc as unknown as RTCPeerConnection, 2000);
+    queueMicrotask(() => {
+      pc.iceGatheringState = "complete";
+      pc.onicegatheringstatechange?.();
+    });
+    await done;
+    expect(pc.iceGatheringState).toBe("complete");
+  });
+
+  it("connect posts offer only after ICE gathering is complete", async () => {
+    let offerAtMs = 0;
+    let gatherDoneAtMs = 0;
+    class SlowGatherPC extends FakeRTCPeerConnection {
+      async setLocalDescription(desc: { type: string; sdp: string }): Promise<void> {
+        this.localDescription = desc;
+        this.iceGatheringState = "gathering";
+        setTimeout(() => {
+          gatherDoneAtMs = Date.now();
+          this.iceGatheringState = "complete";
+          this.onicegatheringstatechange?.();
+        }, 40);
+      }
+    }
+
+    const WebSocketImpl = class extends FakeWebSocket {
+      constructor(url: string) {
+        super(url);
+        this.autoReply = (frame) => {
+          if (frame.type === "join") return { type: "joined", session_id: "room-ice" };
+          if (frame.type === "offer") {
+            offerAtMs = Date.now();
+            return { type: "answer", sdp: "v=0\r\nanswer" };
+          }
+          if (frame.type === "ice") return { type: "ice_ok" };
+          return null;
+        };
+      }
+    } as unknown as typeof WebSocket;
+
+    const room = new XylonRoom();
+    await room.connect({
+      wsUrl: "ws://test/v1/ws",
+      token: "tok",
+      library: "datachannel",
+      dataChannelLabels: ["chat"],
+      WebSocketImpl,
+      RTCPeerConnectionImpl: SlowGatherPC as unknown as typeof RTCPeerConnection
+    });
+    expect(gatherDoneAtMs).toBeGreaterThan(0);
+    expect(offerAtMs).toBeGreaterThanOrEqual(gatherDoneAtMs);
+    room.close();
+  });
+
   it("connect: join, offer/answer, trickle ice", async () => {
     let lastWs: FakeWebSocket | null = null;
     const WebSocketImpl = class extends FakeWebSocket {
@@ -192,6 +248,48 @@ describe("XylonRoom", () => {
     room.close();
   });
 
+  it("empty-string onicecandidate is end-of-candidates (Firefox)", async () => {
+    const iceFrames: Record<string, unknown>[] = [];
+    const WebSocketImpl = installWs((frame) => {
+      if (frame.type === "join") return { type: "joined", session_id: "r1" };
+      if (frame.type === "offer") return { type: "answer", sdp: "v=0\r\na" };
+      if (frame.type === "ice") {
+        iceFrames.push(frame);
+        return { type: "ice_ok" };
+      }
+      return null;
+    });
+
+    const room = new XylonRoom();
+    await room.connect({
+      wsUrl: "ws://test/v1/ws",
+      token: "tok",
+      WebSocketImpl,
+      RTCPeerConnectionImpl: FakeRTCPeerConnection as unknown as typeof RTCPeerConnection
+    });
+
+    const before = iceFrames.length;
+    const pc = room.peerConnection as unknown as FakeRTCPeerConnection;
+    pc.onicecandidate?.({
+      candidate: {
+        candidate: "",
+        sdpMid: "1",
+        sdpMLineIndex: 1
+      }
+    });
+    await vi.waitFor(() => expect(iceFrames.length).toBeGreaterThan(before));
+
+    const eoc = iceFrames[iceFrames.length - 1]!;
+    expect(eoc).toMatchObject({
+      type: "ice",
+      candidate: null,
+      sdpMid: "1",
+      end_of_candidates: true
+    });
+    expect(eoc.candidate).not.toBe("");
+    room.close();
+  });
+
   it("applies unsolicited server ice via addIceCandidate", async () => {
     let lastWs: FakeWebSocket | null = null;
     const WebSocketImpl = class extends FakeWebSocket {
@@ -233,6 +331,128 @@ describe("XylonRoom", () => {
       )
     );
     expect(lastWs).not.toBeNull();
+    room.close();
+  });
+
+  it("publish_layers scopes setParameters to matching mid only", async () => {
+    let lastWs: FakeWebSocket | null = null;
+    const WebSocketImpl = class extends FakeWebSocket {
+      constructor(url: string) {
+        super(url);
+        lastWs = this;
+        this.autoReply = (frame) => {
+          if (frame.type === "join") return { type: "joined", session_id: "r1" };
+          if (frame.type === "offer") return { type: "answer", sdp: "v=0\r\na" };
+          if (frame.type === "ice") return { type: "ice_ok" };
+          return null;
+        };
+      }
+    } as unknown as typeof WebSocket;
+
+    const room = new XylonRoom();
+    await room.connect({
+      wsUrl: "ws://test/v1/ws",
+      token: "tok",
+      library: "conference",
+      WebSocketImpl,
+      RTCPeerConnectionImpl: FakeRTCPeerConnection as unknown as typeof RTCPeerConnection
+    });
+
+    const pc = room.peerConnection as unknown as FakeRTCPeerConnection;
+    const cam1 = new FakeRtpSender({ kind: "video" }, [
+      { rid: "q", active: true },
+      { rid: "h", active: true }
+    ]);
+    const cam2 = new FakeRtpSender({ kind: "video" }, [
+      { rid: "q", active: true },
+      { rid: "h", active: true }
+    ]);
+    pc.transceivers = [
+      new FakeRtpTransceiver("1", cam1),
+      new FakeRtpTransceiver("2", cam2)
+    ];
+
+    lastWs!.reply({
+      type: "publish_layers",
+      mid: "1",
+      layers: [
+        { rid: "q", active: true },
+        { rid: "h", active: false }
+      ]
+    });
+
+    await vi.waitFor(() => expect(cam1.setParametersCalls).toBe(1));
+    expect(cam1.encodings).toEqual([
+      { rid: "q", active: true },
+      { rid: "h", active: false }
+    ]);
+    expect(cam2.setParametersCalls).toBe(0);
+    expect(cam2.encodings).toEqual([
+      { rid: "q", active: true },
+      { rid: "h", active: true }
+    ]);
+    room.close();
+  });
+
+  it("send with dest sets envelope to on the datachannel", async () => {
+    const WebSocketImpl = installWs((frame) => {
+      if (frame.type === "join") return { type: "joined", session_id: "room-dest" };
+      if (frame.type === "offer") return { type: "answer", sdp: "v=0\r\nanswer" };
+      if (frame.type === "ice") return { type: "ice_ok" };
+      return null;
+    });
+
+    const room = new XylonRoom();
+    await room.connect({
+      wsUrl: "ws://test/v1/ws",
+      token: "tok",
+      library: "datachannel",
+      dataChannelLabels: ["chat"],
+      WebSocketImpl,
+      RTCPeerConnectionImpl: FakeRTCPeerConnection as unknown as typeof RTCPeerConnection
+    });
+
+    room.send("chat", { type: "chat", text: "hi" }, { dest: ["bob", "carol"] });
+    const dc = room.dataChannel("chat") as unknown as { sent: string[] };
+    expect(dc.sent).toHaveLength(1);
+    expect(JSON.parse(dc.sent[0]!)).toEqual({
+      type: "chat",
+      text: "hi",
+      to: ["bob", "carol"]
+    });
+
+    room.close();
+  });
+
+  it("reconnect closes then connects with fresh getToken", async () => {
+    let tokens = 0;
+    const WebSocketImpl = installWs((frame) => {
+      if (frame.type === "join") return { type: "joined", session_id: "r-re" };
+      if (frame.type === "offer") return { type: "answer", sdp: "v=0\r\na" };
+      if (frame.type === "ice") return { type: "ice_ok" };
+      return null;
+    });
+
+    const room = new XylonRoom();
+    const opts = {
+      wsUrl: "ws://test/v1/ws",
+      getToken: async () => {
+        tokens += 1;
+        return `tok-${tokens}`;
+      },
+      library: "datachannel",
+      WebSocketImpl,
+      RTCPeerConnectionImpl: FakeRTCPeerConnection as unknown as typeof RTCPeerConnection
+    };
+
+    await room.connect(opts);
+    expect(tokens).toBe(1);
+    const firstPc = room.peerConnection;
+
+    await room.reconnect(opts);
+    expect(tokens).toBe(2);
+    expect(room.peerConnection).not.toBe(firstPc);
+    expect(room.sessionId).toBe("r-re");
     room.close();
   });
 });

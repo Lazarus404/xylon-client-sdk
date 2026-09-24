@@ -99,18 +99,86 @@ const chat = room.dataChannel("chat") || room.createDataChannel("chat");
 chat.send("hello");
 ```
 
+### Targeted send
+
+Set envelope `"to"` to a participant id or id list. The Backend fans out only to
+those ids (filters / roles / groups are not valid on the media path -- resolve
+them via Control `POST .../dest/resolve` first).
+
+```ts
+import { resolveDest, sendJson, sendResolvedJson, XylonRoom } from "xylon-client-sdk";
+
+room.send("chat", { type: "chat", text: "hi" }, { dest: ["bob", "carol"] });
+// or:
+const chat = room.dataChannel("chat")!;
+sendJson(chat, { type: "chat", text: "hi" }, { dest: "bob" });
+```
+
+#### Named groups
+
+Control owns group membership (`POST/GET/DELETE .../groups`). Resolve a group to
+ids, then send:
+
+```ts
+import { resolveDest, sendResolvedJson } from "xylon-client-sdk";
+
+const { dest } = await resolveDest(
+  "https://edge.example",
+  { token, tenantId: "acme", sessionId: "room-1", participantId: "self" },
+  { group: "breakout-a" }
+);
+sendResolvedJson(chat, { type: "chat", text: "hi team" }, dest);
+```
+
+Join also receives `groups.snapshot`; live changes arrive as `groups.diff`
+(`room.onGroupsSnapshot` / `room.onGroupsDiff`).
+
+#### Host egress routes
+
+Interest / AOI stays in your app: compute participant ids, then have your admin
+backend call Control `PUT .../routes/:sender_id` with `{"dest": ["id", ...]}`
+(optional `label`). Clients that omit envelope `"to"` inherit that default.
+Per-message `room.send(..., { dest })` still overrides the route. `DELETE` without
+`?label=` clears all labels for that sender; with `?label=` clears one row. The
+SDK does not mint routes -- host only.
+
 Declare `dataChannelLabels` on connect when channels must appear in the offer SDP.
 Opening new labels after connect may require renegotiation that the server does not
 support.
 
-`getToken` is preferred over a static `token`. v1 does not auto-reconnect or refresh
-mid-session; pass a fresh `getToken` / `token` on the next `connect`.
+`getToken` is preferred over a static `token`. There is no silent auto-reconnect;
+call `room.reconnect(opts)` (or `close` + `connect`) with a fresh `getToken` /
+`token` after `failed` / `disconnected`. Recreate `RpcClient` / state helpers after
+reconnect; in-flight RPC is not preserved. Token TTL must cover the session or
+you must reconnect before expiry.
+
+Optional lossy `input` label (`INPUT_LABEL` / `INPUT_CHANNEL_INIT`, same unreliable
+init as `state`) is not in `GAME_DATA_CHANNEL_LABELS` -- add it to
+`dataChannelLabels` when needed:
+
+```ts
+import {
+  GAME_DATA_CHANNEL_LABELS,
+  INPUT_LABEL,
+  XylonRoom
+} from "xylon-client-sdk";
+
+await room.connect({
+  wsUrl: "wss://edge.example/v1/ws",
+  getToken: () => fetchTokenFromYourBackend(),
+  library: "datachannel",
+  dataChannelLabels: [...GAME_DATA_CHANNEL_LABELS, INPUT_LABEL]
+});
+```
 
 ## RPC (datachannel)
 
 Use labels `chat` / `rpc` / `state` (`GAME_DATA_CHANNEL_LABELS`) and open them in the
 offer. Create the Session with `mode: "mfu"` and `rpc_router: true` so the server
 delivers `rpc.req` only to `to` (without the router, every peer receives the bytes).
+`to` may be a participant id, an id list, or `"*"` (everyone except the caller).
+Broadcast/multicast payloads are visible to all destinations; the first `rpc.res` /
+`rpc.err` wins.
 
 ```ts
 import {
@@ -142,10 +210,12 @@ const rpc = createRpcClient({
 
 rpc.registerRpcMethod("ping", (payload) => ({ pong: payload }));
 const result = await rpc.performRpc("bob", "ping", { n: 1 }, { timeoutMs: 2000 });
+await rpc.performRpc("*", "announce", { msg: "hi" });
+await rpc.performRpc(["bob", "carol"], "vote", { choice: 1 });
 ```
 
-`RpcClient` ignores inbound `rpc.req` when `to` is not the local participant id
-(defense in depth). Call `rpc.close()` when leaving the room.
+`RpcClient` ignores inbound `rpc.req` unless `to` is the local id, `"*"`, or a list
+containing the local id (defense in depth). Call `rpc.close()` when leaving the room.
 
 ## State (Unity-style ticks)
 
@@ -222,11 +292,25 @@ const presence = await fetchPresence("https://edge.example", {
 ## Conference subscribe (manual)
 
 With `library: "conference"` and `backendOpts: { subscribe_mode: "manual" }`, listen
-to feeds then call:
+to feeds then call. Optional room opt `adaptive_layers: true` lets subscriber REMB
+(and TWCC when present) drive receive-side SIM/SVC layer picks (manual
+`substream` / layer opts stay sticky). Optional `dynacast: true` pushes
+`publish_layers` so this SDK toggles SIM `encodings[].active` on the local
+transceiver whose `mid` matches (Chrome-first; Firefox Soft spot if
+`active: false` is ignored). For Chrome SIM/SVC publish, pass
+`videoPublish: { simulcast: true }` or `{ scalabilityMode: "L3T3_KEY", codec: "video/VP9" }`
+on `connect`:
 
 ```ts
 await room.subscribe({ publisherId: "alice", kind: "audio" });
 await room.subscribe({ publisherId: "alice", kind: "video", substream: 1 });
+await room.setSubstream({
+  publisherId: "alice",
+  kind: "video",
+  mid: "1",
+  spatialLayer: 1,
+  temporalLayer: 0
+});
 await room.switch({ publisherId: "bob", kind: "video" });
 await room.unsubscribe({ publisherId: "alice", kind: "audio" });
 ```
@@ -237,6 +321,7 @@ Same methods exist on `ControlSignaling`. Recipe:
 
 ## Out of scope (v1)
 
-Auto-reconnect, SIP, HTTP JSEP primary path, Control-WS inject frames,
+Silent auto-reconnect loops, SIP, HTTP JSEP primary path, Control-WS inject frames,
 Sync/CRDT, MFU codecs, WS `pause`/`resume` (Elixir Plan pause only today).
-Customer-admin login UI (use `prepareRequest` / cookies on `AdminClient`).
+Use explicit `XylonRoom.reconnect(opts)` after disconnect. Customer-admin login UI
+(use `prepareRequest` / cookies on `AdminClient`).

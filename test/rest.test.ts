@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
-import { fetchHistory, fetchPresence } from "../src/rest.js";
+import { fetchHistory, fetchPresence, resolveDest } from "../src/rest.js";
+import { sendResolvedJson } from "../src/send.js";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -49,6 +50,36 @@ describe("rest helpers", () => {
     );
   });
 
+  it("resolveDest posts group filter", async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ ok: true, dest: ["a", "b"] })
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await resolveDest(
+      "https://edge.example",
+      {
+        token: "tok",
+        tenantId: "acme",
+        sessionId: "room-1",
+        participantId: "self"
+      },
+      { group: "breakout" }
+    );
+
+    expect(result).toEqual({ ok: true, dest: ["a", "b"] });
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe(
+      "https://edge.example/v1/tenants/acme/sessions/room-1/dest/resolve"
+    );
+    expect(init).toMatchObject({ method: "POST" });
+    expect(JSON.parse(String((init as RequestInit).body))).toEqual({
+      dest: { group: "breakout" },
+      participant_id: "self"
+    });
+  });
+
   it("throws on non-OK", async () => {
     vi.stubGlobal(
       "fetch",
@@ -66,5 +97,23 @@ describe("rest helpers", () => {
         sessionId: "room-1"
       })
     ).rejects.toThrow(/401/);
+  });
+});
+
+describe("sendResolvedJson", () => {
+  it("sets to for id list and omits for all", () => {
+    const sent: string[] = [];
+    const ch = {
+      readyState: "open",
+      send: (s: string) => sent.push(s)
+    };
+    void sendResolvedJson(ch, { type: "chat", text: "x" }, ["b", "c"]);
+    expect(JSON.parse(sent[0]!)).toEqual({
+      type: "chat",
+      text: "x",
+      to: ["b", "c"]
+    });
+    void sendResolvedJson(ch, { type: "chat", text: "y" }, "all");
+    expect(JSON.parse(sent[1]!)).toEqual({ type: "chat", text: "y" });
   });
 });

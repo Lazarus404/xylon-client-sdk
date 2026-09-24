@@ -49,9 +49,14 @@ type RpcChannel = {
 /**
  * Peer RPC over the `rpc` datachannel label (LiveKit-style performRpc).
  *
- * With backend `rpc_router: true`, the server fans `rpc.req` only to `to`.
+ * With backend `rpc_router: true`, the server fans `rpc.req` to `to`
+ * (participant id, id list, or `"*"` for everyone except the caller).
  * Without it, every peer may receive the bytes -- this client still ignores
- * requests where `to` is not the local participant id.
+ * requests that are not addressed to the local participant (`to` string match,
+ * `"*"`, or id list containing self).
+ *
+ * For broadcast/multicast, the first `rpc.res` / `rpc.err` wins (server keeps
+ * one pending row per request id).
  */
 export class RpcClient {
   readonly localParticipantId: string;
@@ -82,9 +87,10 @@ export class RpcClient {
 
   /**
    * Sends `rpc.req` and waits for matching `rpc.res` / `rpc.err`.
+   * `destination` is a participant id, id list, or `"*"` (except sender).
    */
   performRpc(
-    destinationId: string,
+    destination: string | string[] | "*",
     method: string,
     payload: unknown,
     opts: PerformRpcOptions = {}
@@ -98,7 +104,7 @@ export class RpcClient {
       type: "rpc.req",
       id,
       method,
-      to: destinationId,
+      to: destination,
       payload
     });
 
@@ -158,8 +164,7 @@ export class RpcClient {
   }
 
   private async handleRequest(msg: Record<string, unknown>): Promise<void> {
-    const to = msg.to;
-    if (typeof to === "string" && to !== this.localParticipantId) {
+    if (!rpcReqAddressedToSelf(msg.to, this.localParticipantId)) {
       return;
     }
     const id = typeof msg.id === "string" ? msg.id : null;
@@ -222,6 +227,15 @@ export class RpcClient {
     if (this.channel.readyState !== "open") return;
     this.channel.send(JSON.stringify(obj));
   }
+}
+
+function rpcReqAddressedToSelf(to: unknown, localId: string): boolean {
+  if (to === "*") return true;
+  if (typeof to === "string") return to === localId;
+  if (Array.isArray(to)) {
+    return to.some((id) => typeof id === "string" && id === localId);
+  }
+  return false;
 }
 
 /** Opens RpcClient on `room.dataChannel("rpc")` or creates the channel. */

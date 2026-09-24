@@ -12,7 +12,8 @@ type PendingExpect =
   | "ice_ok"
   | "subscribed"
   | "unsubscribed"
-  | "switched";
+  | "switched"
+  | "substream_set";
 
 /** Error from a Control WS `{ type: "error", reason }` frame. */
 export class SignalingError extends Error {
@@ -52,9 +53,21 @@ export class ControlSignaling {
   onFeedsDiff:
     | ((frame: Extract<ServerFrame, { type: "feeds.diff" }>) => void)
     | null = null;
+  /** Fired after join with named groups map. */
+  onGroupsSnapshot:
+    | ((frame: Extract<ServerFrame, { type: "groups.snapshot" }>) => void)
+    | null = null;
+  /** Fired on group create/delete/member change. */
+  onGroupsDiff:
+    | ((frame: Extract<ServerFrame, { type: "groups.diff" }>) => void)
+    | null = null;
   /** Fired on talking / stopped-talking edges (audio-level). */
   onTalking:
     | ((frame: Extract<ServerFrame, { type: "talking" | "stopped-talking" }>) => void)
+    | null = null;
+  /** Fired when Dynacast asks the publisher to pause/resume SIM encodings. */
+  onPublishLayers:
+    | ((frame: Extract<ServerFrame, { type: "publish_layers" }>) => void)
     | null = null;
 
   private pending: {
@@ -141,6 +154,17 @@ export class ControlSignaling {
     return this.request("switched", subscribeBody("switch", params)).then(() => undefined);
   }
 
+  /**
+   * Changes simulcast / SVC layer opts on an existing subscription
+   * (`substream` / `rid` / `temporal` / `spatialLayer` / `temporalLayer`).
+   * Awaits `{ type: "substream_set" }`. Prefer `mid` from feeds.
+   */
+  setSubstream(params: SubscribeParams): Promise<void> {
+    return this.request("substream_set", subscribeBody("set_substream", params)).then(
+      () => undefined
+    );
+  }
+
   close(): void {
     this.ws.removeEventListener("message", this.onMessage);
     if (this.pending) {
@@ -197,8 +221,20 @@ export class ControlSignaling {
       this.onFeedsDiff?.(frame);
       return;
     }
+    if (frame.type === "groups.snapshot") {
+      this.onGroupsSnapshot?.(frame);
+      return;
+    }
+    if (frame.type === "groups.diff") {
+      this.onGroupsDiff?.(frame);
+      return;
+    }
     if (frame.type === "talking" || frame.type === "stopped-talking") {
       this.onTalking?.(frame);
+      return;
+    }
+    if (frame.type === "publish_layers") {
+      this.onPublishLayers?.(frame);
       return;
     }
 
@@ -229,7 +265,7 @@ export class ControlSignaling {
 }
 
 function subscribeBody(
-  type: "subscribe" | "unsubscribe" | "switch",
+  type: "subscribe" | "unsubscribe" | "switch" | "set_substream",
   params: SubscribeParams
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
@@ -240,6 +276,9 @@ function subscribeBody(
   if (params.mid) body.mid = params.mid;
   if (params.substream != null) body.substream = params.substream;
   if (params.rid) body.rid = params.rid;
+  if (params.temporal != null) body.temporal = params.temporal;
+  if (params.spatialLayer != null) body.spatial_layer = params.spatialLayer;
+  if (params.temporalLayer != null) body.temporal_layer = params.temporalLayer;
   return body;
 }
 

@@ -3,6 +3,8 @@ export type {
   FeedPublisher,
   FeedsDiffFrame,
   FeedsSnapshotFrame,
+  GroupsDiffFrame,
+  GroupsSnapshotFrame,
   IceCandidateParams,
   JoinParams,
   MediaKind,
@@ -13,6 +15,7 @@ export type {
   ServerFrame,
   SubscribeParams,
   TalkingFrame,
+  VideoPublishOptions,
   WsLike
 } from "./types.js";
 
@@ -24,11 +27,20 @@ export type {
 
 export { AdminClient, AdminError } from "./admin.js";
 export { ControlSignaling, SignalingError } from "./signaling.js";
-export { XylonRoom, waitDataChannelOpen } from "./room.js";
-export { fetchHistory, fetchPresence } from "./rest.js";
+export { XylonRoom, waitDataChannelOpen, waitIceGatheringComplete } from "./room.js";
+export {
+  fetchHistory,
+  fetchPresence,
+  resolveDest
+} from "./rest.js";
+export type { ResolveDestFilter, ResolveDestResult } from "./rest.js";
+export { encodeTargetedJson, sendJson, sendResolvedJson } from "./send.js";
+export type { SendJsonOptions } from "./send.js";
 export {
   CHAT_LABEL,
   GAME_DATA_CHANNEL_LABELS,
+  INPUT_CHANNEL_INIT,
+  INPUT_LABEL,
   RPC_LABEL,
   STATE_CHANNEL_INIT,
   STATE_LABEL,

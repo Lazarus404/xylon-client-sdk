@@ -141,6 +141,40 @@ describe("ControlSignaling", () => {
     await expect(iceP).resolves.toBeUndefined();
   });
 
+  it("dispatches groups snapshot and diff frames", async () => {
+    const ws = new FakeWebSocket("ws://test/v1/ws");
+    const sig = new ControlSignaling(ws);
+    await ws.waitOpen();
+
+    const snapshots: unknown[] = [];
+    const diffs: unknown[] = [];
+    sig.onGroupsSnapshot = (f) => snapshots.push(f);
+    sig.onGroupsDiff = (f) => diffs.push(f);
+
+    ws.reply({
+      type: "groups.snapshot",
+      groups: { breakout: ["a", "b"] }
+    });
+    expect(snapshots).toEqual([
+      { type: "groups.snapshot", groups: { breakout: ["a", "b"] } }
+    ]);
+
+    ws.reply({
+      type: "groups.diff",
+      action: "add_member",
+      group_id: "breakout",
+      participant_id: "c"
+    });
+    expect(diffs).toEqual([
+      {
+        type: "groups.diff",
+        action: "add_member",
+        group_id: "breakout",
+        participant_id: "c"
+      }
+    ]);
+  });
+
   it("dispatches presence frames without stealing joined", async () => {
     const ws = new FakeWebSocket("ws://test/v1/ws");
     const sig = new ControlSignaling(ws);
@@ -219,6 +253,30 @@ describe("ControlSignaling", () => {
     expect(talking).toHaveLength(2);
   });
 
+  it("dispatches publish_layers without stealing joined", async () => {
+    const ws = new FakeWebSocket("ws://test/v1/ws");
+    const sig = new ControlSignaling(ws);
+    await ws.waitOpen();
+
+    const layers: unknown[] = [];
+    sig.onPublishLayers = (f) => layers.push(f);
+
+    const joinP = sig.join({ token: "tok", sessionId: "r1", tenantId: "t1" });
+    ws.reply({ type: "joined", session_id: "r1" });
+    await joinP;
+
+    ws.reply({
+      type: "publish_layers",
+      mid: "1",
+      layers: [
+        { rid: "q", active: true },
+        { rid: "h", active: false }
+      ]
+    });
+    expect(layers).toHaveLength(1);
+    expect(layers[0]).toMatchObject({ type: "publish_layers", mid: "1" });
+  });
+
   it("subscribe unsubscribe switch await ack frames", async () => {
     const ws = new FakeWebSocket("ws://test/v1/ws");
     const sig = new ControlSignaling(ws);
@@ -250,5 +308,41 @@ describe("ControlSignaling", () => {
     });
     ws.reply({ type: "switched" });
     await swP;
+
+    const layerP = sig.setSubstream({
+      publisherId: "a",
+      kind: "video",
+      mid: "1",
+      substream: 0,
+      rid: "q"
+    });
+    expect(JSON.parse(ws.sent[3]!)).toEqual({
+      type: "set_substream",
+      publisher_id: "a",
+      kind: "video",
+      mid: "1",
+      substream: 0,
+      rid: "q"
+    });
+    ws.reply({ type: "substream_set" });
+    await expect(layerP).resolves.toBeUndefined();
+
+    const svcP = sig.setSubstream({
+      publisherId: "a",
+      kind: "video",
+      mid: "1",
+      spatialLayer: 1,
+      temporalLayer: 0
+    });
+    expect(JSON.parse(ws.sent[4]!)).toEqual({
+      type: "set_substream",
+      publisher_id: "a",
+      kind: "video",
+      mid: "1",
+      spatial_layer: 1,
+      temporal_layer: 0
+    });
+    ws.reply({ type: "substream_set" });
+    await expect(svcP).resolves.toBeUndefined();
   });
 });
